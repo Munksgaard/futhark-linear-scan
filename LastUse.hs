@@ -32,7 +32,7 @@ class LastUses a where
   lastUses :: a -> Map VName Int
 
 instance ASTLore lore => LastUses (Body lore) where
-  lastUses (Body {bodyStms, bodyResult}) =
+  lastUses Body {bodyStms, bodyResult} =
     let last_use_map =
           zip (toList bodyStms) [0 ..]
             & reverse
