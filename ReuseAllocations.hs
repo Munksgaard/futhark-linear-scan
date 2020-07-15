@@ -6,7 +6,6 @@
 module ReuseAllocations (reuseAllocationsPass) where
 
 import Control.Monad.Reader
--- import Data.Function ((&))
 import qualified Data.List as List
 import qualified Data.Map as Map
 import Data.Maybe (catMaybes)
@@ -15,7 +14,6 @@ import Debug.Trace
 import qualified Futhark.Analysis.Alias as Alias
 import Futhark.IR.KernelsMem
 import Futhark.Pass (Pass (..), intraproceduralTransformation)
-import Futhark.Util.Pretty
 import qualified LastUse
 import LastUse (LastUseMap)
 
@@ -24,9 +22,6 @@ type Frees = [(VName, SubExp)]
 type Allocs = [(VName, SubExp)]
 
 type ReuseAllocsM = Reader (Scope KernelsMem)
-
-traceWith :: Pretty a => String -> a -> a
-traceWith s a = trace (s ++ ": " ++ pretty a) a
 
 reuseAllocationsPass :: Pass KernelsMem KernelsMem
 reuseAllocationsPass =
@@ -55,14 +50,15 @@ optimiser stms =
         stms'
 
 optimiseStms :: LastUseMap -> Allocs -> Frees -> Stms KernelsMem -> ReuseAllocsM (Allocs, Frees, Stms KernelsMem)
-optimiseStms lu_map allocs frees stms = do
-  (allocs', frees', stms') <- foldM (walkStms lu_map) (allocs, frees, []) $ stmsToList stms
-  return (allocs', frees', stmsFromList $ reverse stms')
+optimiseStms lu_map allocs frees stms =
+  localScope (scopeOf stms) $ do
+    (allocs', frees', stms') <- foldM (walkStms lu_map) (allocs, frees, []) $ stmsToList stms
+    return (allocs', frees', stmsFromList $ reverse stms')
 
 walkStms :: LastUseMap -> (Allocs, Frees, [Stm KernelsMem]) -> Stm KernelsMem -> ReuseAllocsM (Allocs, Frees, [Stm KernelsMem])
 walkStms _ (allocs, frees, acc) stm@Let {stmExp = Op (Alloc sexp _), stmPattern = Pattern {patternValueElements = [PatElem {patElemName}]}} =
   localScope (scopeOf stm) $ do
-    case lookup (traceWith (pretty patElemName ++ " lookup") sexp) $ map swap $ traceWith "frees" frees of
+    case lookup sexp $ map swap $ trace (unwords [pretty patElemName, "frees", pretty frees]) frees of
       Just mem ->
         return $
           trace
@@ -70,17 +66,26 @@ walkStms _ (allocs, frees, acc) stm@Let {stmExp = Op (Alloc sexp _), stmPattern 
             ((patElemName, sexp) : allocs, filter ((/=) sexp . snd) frees, stm {stmExp = BasicOp $ SubExp $ Var mem} : acc)
       Nothing ->
         return ((patElemName, sexp) : allocs, frees, stm : acc)
-walkStms lu_map (allocs, frees, acc) stm@Let {stmExp = Op (Inner (SegOp (SegScan lvl sp binops tps body)))} =
-  localScope (scopeOf stm) $ do
+walkStms lu_map (allocs, frees, acc) stm@Let {stmExp = Op (Inner (SegOp (SegMap lvl sp tps body)))} =
+  localScope (scopeOfSegSpace sp) $ do
+    (allocs', frees', body') <- optimiseKernelBody lu_map allocs frees body
+    return (allocs', frees', stm {stmExp = Op $ Inner $ SegOp $ SegMap lvl sp tps body'} : acc)
+walkStms lu_map (allocs, frees, acc) stm@Let {stmExp = Op (Inner (SegOp (SegScan lvl sp binops tps body)))} = do
+  localScope (scopeOfSegSpace sp) $ do
     (allocs', frees', body') <- optimiseKernelBody lu_map allocs frees body
     (allocs'', frees'', binops') <- foldM (optimiseSegBinOp lu_map) (allocs', frees', []) binops
     return (allocs'', frees'', stm {stmExp = Op $ Inner $ SegOp $ SegScan lvl sp (reverse binops') tps body'} : acc)
 walkStms lu_map (allocs, frees, acc) stm@Let {stmExp = Op (Inner (SegOp (SegRed lvl sp binops tps body)))} =
-  localScope (scopeOf stm) $ do
+  localScope (scopeOfSegSpace sp) $ do
     (allocs', frees', body') <- optimiseKernelBody lu_map allocs frees body
     (allocs'', frees'', binops') <- foldM (optimiseSegBinOp lu_map) (allocs', frees', []) binops
     return (allocs'', frees'', stm {stmExp = Op $ Inner $ SegOp $ SegRed lvl sp (reverse binops') tps body'} : acc)
-walkStms lu_map (allocs, frees, acc) stm =
+walkStms lu_map (allocs, frees, acc) stm@Let {stmExp = Op (Inner (SegOp (SegHist lvl sp histops tps body)))} =
+  localScope (scopeOfSegSpace sp) $ do
+    (allocs', frees', body') <- optimiseKernelBody lu_map allocs frees body
+    (allocs'', frees'', histops') <- foldM (optimiseHistOp lu_map) (allocs', frees', []) histops
+    return (allocs'', frees'', stm {stmExp = Op $ Inner $ SegOp $ SegHist lvl sp (reverse histops') tps body'} : acc)
+walkStms lu_map (allocs, frees, acc) stm = do
   localScope (scopeOf stm) $ do
     let pat_name = patElemName $ head $ patternValueElements $ stmPattern stm
     let lus = Map.lookup pat_name lu_map
@@ -88,29 +93,37 @@ walkStms lu_map (allocs, frees, acc) stm =
     let new_frees' = catMaybes new_frees
     return $
       trace
-        (pretty pat_name ++ " adding new frees: " ++ pretty new_frees' ++ " to already " ++ pretty frees)
+        (unwords [pretty pat_name, " adding new frees: ", pretty new_frees', " to already ", pretty frees, " from lus:", pretty lus, " and allocs: ", pretty allocs])
         (allocs, new_frees' ++ frees, stm : acc)
 
 optimiseKernelBody :: LastUseMap -> Allocs -> Frees -> KernelBody KernelsMem -> ReuseAllocsM (Allocs, Frees, KernelBody KernelsMem)
-optimiseKernelBody lu_map allocs frees body@KernelBody {kernelBodyStms} = do
-  (allocs', frees', stms) <-
-    foldM (walkStms lu_map) (allocs, frees, []) $ stmsToList kernelBodyStms
-  return (allocs', frees', body {kernelBodyStms = stmsFromList $ reverse stms})
+optimiseKernelBody lu_map allocs frees body@KernelBody {kernelBodyStms} =
+  localScope (scopeOf kernelBodyStms) $ do
+    (allocs', frees', stms) <-
+      foldM (walkStms lu_map) (allocs, frees, []) $ stmsToList kernelBodyStms
+    return (allocs', frees', body {kernelBodyStms = stmsFromList $ reverse stms})
 
 optimiseSegBinOp :: LastUseMap -> (Allocs, Frees, [SegBinOp KernelsMem]) -> SegBinOp KernelsMem -> ReuseAllocsM (Allocs, Frees, [SegBinOp KernelsMem])
 optimiseSegBinOp lu_map (allocs, frees, acc) binop@SegBinOp {segBinOpLambda} = do
   (allocs', frees', lambda) <- optimiseLambda lu_map allocs frees segBinOpLambda
   return (allocs', frees', binop {segBinOpLambda = lambda} : acc)
 
+optimiseHistOp :: LastUseMap -> (Allocs, Frees, [HistOp KernelsMem]) -> HistOp KernelsMem -> ReuseAllocsM (Allocs, Frees, [HistOp KernelsMem])
+optimiseHistOp lu_map (allocs, frees, acc) histop@HistOp {histOp} = do
+  (allocs', frees', lambda) <- optimiseLambda lu_map allocs frees histOp
+  return (allocs', frees', histop {histOp = lambda} : acc)
+
 optimiseLambda :: LastUseMap -> Allocs -> Frees -> Lambda KernelsMem -> ReuseAllocsM (Allocs, Frees, Lambda KernelsMem)
-optimiseLambda lu_map allocs frees lambda = do
-  (allocs', frees', body) <- optimiseBody lu_map allocs frees $ lambdaBody lambda
-  return (allocs', frees', lambda {lambdaBody = body})
+optimiseLambda lu_map allocs frees lambda =
+  localScope (scopeOfLParams $ lambdaParams lambda) $ do
+    (allocs', frees', body) <- optimiseBody lu_map allocs frees $ lambdaBody lambda
+    return (allocs', frees', lambda {lambdaBody = body})
 
 optimiseBody :: LastUseMap -> Allocs -> Frees -> Body KernelsMem -> ReuseAllocsM (Allocs, Frees, Body KernelsMem)
-optimiseBody lu_map allocs frees body = do
-  (allocs', frees', stms') <- optimiseStms lu_map allocs frees $ bodyStms body
-  return (allocs', frees', body {bodyStms = stms'})
+optimiseBody lu_map allocs frees body =
+  localScope (scopeOf $ bodyStms body) $ do
+    (allocs', frees', stms') <- optimiseStms lu_map allocs frees $ bodyStms body
+    return (allocs', frees', body {bodyStms = stms'})
 
 memAndSize :: Allocs -> VName -> ReuseAllocsM (Maybe (VName, SubExp))
 memAndSize allocs vname = do
