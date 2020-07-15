@@ -21,7 +21,8 @@ executable futhark-linear-scan
   main-is:             Main.hs
   -- other-modules:
   -- other-extensions:
-  -- ghc-options:         -Wall -Werror -Wcompat -Wredundant-constraints -Wincomplete-record-updates -Wmissing-export-lists
-  build-depends:       base >=4.14 && <4.15, futhark >= 0.15.8, containers
+  ghc-options:         -Wall -Werror -Wcompat -Wredundant-constraints -Wincomplete-record-updates -Wmissing-export-lists
+  build-depends:       base >=4.14 && <4.15, futhark >= 0.15.8, containers, mtl >=2.2.1
+
   default-language:    Haskell2010
-  other-modules:       ReuseAllocations LastUse
+  other-modules:       LastUse ReuseAllocations
