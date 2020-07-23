@@ -1,7 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module LastUse (lastUseAction, analyseFun, analyseStms, LastUseMap) where
+module Futhark.Analysis.LastUse (lastUseAction, analyseFun, analyseStms, LastUseMap) where
 
 import Control.Monad.IO.Class
 import qualified Data.Map as Map

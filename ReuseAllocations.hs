@@ -3,19 +3,31 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module ReuseAllocations (reuseAllocationsPass) where
+module Futhark.Optimise.ReuseAllocations (reuseAllocations, interference) where
 
 import Control.Monad.Reader
+import Data.Function ((&))
+import Data.Functor ((<&>))
 import qualified Data.List as List
 import qualified Data.Map as Map
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
+import qualified Data.Set as Set
+import Data.Set (Set)
 import Data.Tuple (swap)
 import Debug.Trace
 import qualified Futhark.Analysis.Alias as Alias
+import qualified Futhark.Analysis.LastUse as LastUse
+import Futhark.Analysis.LastUse (LastUseMap)
 import Futhark.IR.KernelsMem
+import Futhark.IR.Prop.Names
 import Futhark.Pass (Pass (..), intraproceduralTransformation)
-import qualified LastUse
-import LastUse (LastUseMap)
+import Futhark.Pipeline
+
+type InUse = Names
+
+type LastUsed = Names
+
+type Graph = Set (VName, VName)
 
 type Frees = [(VName, SubExp)]
 
@@ -23,19 +35,125 @@ type Allocs = [(VName, SubExp)]
 
 type ReuseAllocsM = Reader (Scope KernelsMem)
 
-reuseAllocationsPass :: Pass KernelsMem KernelsMem
-reuseAllocationsPass =
+traceWith s p a = trace (s ++ " (" ++ pretty p ++ "): " ++ pretty a) a
+
+insertEdge :: VName -> VName -> Graph -> Graph
+insertEdge v1 v2 g
+  | v1 == v2 = g
+  | otherwise = Set.insert (min v1 v2, max v1 v2) g
+
+cartesian :: Names -> Names -> Graph
+cartesian ns1 ns2 =
+  [(min x y, max x y) | x <- namesToList ns1, y <- namesToList ns2]
+    & foldr (uncurry insertEdge) mempty
+
+analyseStm :: LastUseMap -> InUse -> Graph -> Stm KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
+analyseStm lumap inuse0 graph0 stm =
+  localScope (scopeOf stm) $ do
+    mems <-
+      stmPattern stm
+        & patternValueElements
+        & mapM (memInfo . patElemName)
+        <&> catMaybes
+    let inuse = inuse0 <> namesFromList (mems)
+    let graph = graph0 <> (inuse `cartesian` inuse)
+
+    let pat_name = patElemName $ head $ patternValueElements $ stmPattern stm
+    let lus0 =
+          Map.lookup pat_name lumap
+            & fromMaybe mempty
+
+    case stmExp stm of
+      If cse then_body else_body dec -> do
+        (inuse1, lus1, g1) <- analyseBody lumap then_body
+        (inuse2, lus2, g2) <- analyseBody lumap else_body
+        let lus = lus0 <> lus1 <> lus2
+            inuse' = (inuse <> inuse1 <> inuse2) `namesSubtract` lus
+            g =
+              graph <> g1 <> g2
+                <> ((inuse1 <> lus1) `cartesian` (inuse `namesSubtract` (lus2 `namesSubtract` lus1)))
+                <> ((inuse2 <> lus2) `cartesian` (inuse `namesSubtract` (lus1 `namesSubtract` lus2)))
+        return $ traceWith "If" pat_name (inuse', lus, g)
+      Apply _ _ _ _ -> do
+        let inuse' = inuse `namesSubtract` lus0
+        return $ traceWith "Apply" pat_name (inuse', lus0, graph)
+      BasicOp _ -> do
+        let inuse' = inuse `namesSubtract` lus0
+        return $ traceWith "BasicOp" pat_name (inuse', lus0, graph)
+      DoLoop ctx vals form body -> do
+        (inuse', lus, graph') <- analyseBody lumap body
+        let lus' = lus <> lus0
+        let graph'' = graph <> graph' <> inuse `cartesian` (inuse' <> lus')
+        let inuse'' = inuse `namesSubtract` lus <> inuse'
+        return $ traceWith "DoLoop" pat_name (inuse'', lus', graph'')
+      Op (Inner (SegOp (SegMap lvl _ tps body))) -> do
+        (inuse', lus, graph') <- analyseKernelBody lumap body
+        let lus' = lus <> lus0
+        let graph'' = graph <> graph' <> inuse `cartesian` (inuse' <> lus')
+        let inuse'' = inuse `namesSubtract` lus <> inuse'
+        return $ traceWith "SegMap" pat_name (inuse'', lus', graph'')
+      Op (Inner (SegOp (SegRed lvl _ binops tps body))) -> do
+        undefined
+      Op (Inner (SegOp (SegScan lvl _ binops tps body))) -> do
+        undefined
+      Op (Inner (SegOp (SegHist lvl _ histops tps body))) -> do
+        undefined
+      Op (Inner (SizeOp _)) -> do
+        undefined
+      Op (Inner (OtherOp _)) -> do
+        undefined
+      Op (Alloc _ _) -> do
+        let inuse' = inuse `namesSubtract` lus0
+        return $ traceWith "Alloc" pat_name (inuse', lus0, graph)
+
+analyseKernelBody :: LastUseMap -> KernelBody KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
+analyseKernelBody lumap body = analyseStms lumap $ kernelBodyStms body
+
+analyseBody :: LastUseMap -> Body KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
+analyseBody lumap body = analyseStms lumap $ bodyStms body
+
+analyseStms :: LastUseMap -> Stms KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
+analyseStms lumap stms = do
+  foldM
+    ( \(inuse, lus, graph) stm -> do
+        (inuse', lus', graph') <- analyseStm lumap inuse graph stm
+        return (inuse', lus' <> lus, graph')
+    )
+    (mempty, mempty, mempty)
+    $ stmsToList stms
+
+interference :: Action KernelsMem
+interference =
+  Action
+    { actionName = "memory interference graph",
+      actionDescription = "Analyse interference",
+      actionProcedure = mapM_ helper . progFuns
+    }
+  where
+    helper fun = do
+      let fun' = Alias.analyseFun fun
+      let lumap = fst $ LastUse.analyseFun mempty mempty fun'
+      let (inuse, lastused, graph) = runReader (analyseBody lumap (funDefBody fun)) $ scopeOf fun
+      liftIO $ putStrLn ""
+      liftIO $ putStrLn $ unlines $ fmap (\(x, y) -> pretty x ++ " <-> " ++ pretty y) $ Set.toList graph
+      liftIO $ putStrLn ""
+      liftIO $ putStrLn $ unlines $ fmap pretty $ namesToList inuse
+      liftIO $ putStrLn ""
+      liftIO $ putStrLn $ unlines $ fmap pretty $ namesToList lastused
+
+reuseAllocations :: Pass KernelsMem KernelsMem
+reuseAllocations =
   Pass
     { passName = "reuse allocations",
       passDescription = "reuse allocations in all functions",
-      passFunction = intraproceduralTransformation optimise
+      passFunction = intraproceduralTransformation helper
     }
   where
-    optimise scope stms =
-      return $ runReader (optimiser stms) scope
+    helper scope stms =
+      return $ runReader (optimise stms) scope
 
-optimiser :: Stms KernelsMem -> ReuseAllocsM (Stms KernelsMem)
-optimiser stms =
+optimise :: Stms KernelsMem -> ReuseAllocsM (Stms KernelsMem)
+optimise stms =
   localScope (scopeOf stms) $ do
     let (aliased_stms, _) = Alias.analyseStms mempty stms
         (lu_map, _) = LastUse.analyseStms mempty mempty aliased_stms
@@ -141,3 +259,12 @@ nameInfoToMemInfo info =
     LParamName summary -> summary
     LetName summary -> summary
     IndexName it -> MemPrim $ IntType it
+
+memInfo :: VName -> ReuseAllocsM (Maybe (VName))
+memInfo vname = do
+  summary <- asksScope (fmap nameInfoToMemInfo . Map.lookup vname)
+  case summary of
+    Just (MemArray _ _ _ (ArrayIn mem _)) ->
+      return $ Just mem
+    _ ->
+      return Nothing

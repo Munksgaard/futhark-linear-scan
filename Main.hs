@@ -8,12 +8,13 @@ import Futhark.Compiler
   )
 import Futhark.IR.KernelsMem (KernelsMem)
 import Futhark.IR.SOACS
+import Futhark.Optimise.CSE
+import Futhark.Optimise.ReuseAllocations (interference, reuseAllocations)
 import qualified Futhark.Pass.ExplicitAllocations.Kernels as Kernels
 import Futhark.Pass.Simplify
 import Futhark.Passes (kernelsPipeline)
 import Futhark.Pipeline
 import GHC.IO.Encoding (setLocaleEncoding)
-import ReuseAllocations (reuseAllocationsPass)
 import System.Environment (getArgs)
 import System.IO
 
@@ -23,7 +24,8 @@ pipeline =
     >>> onePass Kernels.explicitAllocations
     >>> passes
       [ simplifyKernelsMem,
-        reuseAllocationsPass
+        performCSE False -- ,
+        -- reuseAllocations
       ]
 
 main :: IO ()
@@ -36,5 +38,5 @@ main = do
   runCompilerOnProgram
     newFutharkConfig
     pipeline
-    printAction
+    interference
     (head args)
