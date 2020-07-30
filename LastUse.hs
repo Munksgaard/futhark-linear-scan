@@ -1,7 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module Futhark.Analysis.LastUse (lastUseAction, analyseFun, analyseStms, LastUseMap) where
+module Futhark.Analysis.LastUse (lastUseAction, analyseFun, analyseStms, LastUseMap, analyseProg) where
 
 import Control.Arrow (first)
 import Control.Monad.IO.Class
@@ -9,13 +9,10 @@ import Data.Foldable
 import Data.Function ((&))
 import qualified Data.Map as Map
 import Data.Map (Map)
-import qualified Data.Set as Set
-import Data.Set (Set)
 import Data.Tuple
 import Futhark.Analysis.Alias (aliasAnalysis)
 import Futhark.IR.Aliases
 import Futhark.IR.KernelsMem
-import Futhark.MonadFreshNames
 import Futhark.Pipeline
 
 lastUseAction :: Action KernelsMem
@@ -60,24 +57,25 @@ analyseStms :: LastUse -> Used -> Stms (Aliases KernelsMem) -> (LastUse, Used)
 analyseStms lumap used stms = foldr analyseStm (lumap, used) $ stmsToList stms
 
 analyseStm :: Stm (Aliases KernelsMem) -> (LastUse, Used) -> (LastUse, Used)
-analyseStm (Let pat _ e) (lumap, used) =
+analyseStm (Let pat _ e) (lumap0, used0) =
   let (lumap', used') =
         patternValueElements pat
           & foldl
             ( \(lumap_acc, used_acc) (PatElem name (aliases, _)) ->
-                ( case Map.lookup pat_name lumap of
+                -- Any aliases of `name` should have the same last-use as `name`
+                ( case Map.lookup name lumap_acc of
                     Just name' ->
                       insertNames name' (unAliases aliases) lumap_acc
                     Nothing -> lumap_acc,
                   used_acc <> unAliases aliases
                 )
             )
-            (lumap, used)
+            (lumap0, used0)
    in analyseExp (lumap', used') e
   where
     pat_name = patElemName $ head $ patternValueElements pat
     analyseExp :: (LastUse, Used) -> Exp (Aliases KernelsMem) -> (LastUse, Used)
-    analyseExp (lumap, used) e@(BasicOp _) =
+    analyseExp (lumap, used) (BasicOp _) =
       let nms = freeIn e `namesSubtract` used
        in (insertNames pat_name nms lumap, used <> nms)
     analyseExp (lumap, used) (Apply _ args _ _) =
@@ -127,7 +125,7 @@ analyseBody lumap used (Body _ stms result) =
    in analyseStms lumap used' stms
 
 analyseKernelBody :: (LastUse, Used) -> KernelBody (Aliases KernelsMem) -> (LastUse, Used)
-analyseKernelBody (lumap, used) (KernelBody dec stms result) =
+analyseKernelBody (lumap, used) (KernelBody _ stms result) =
   let used' = used <> freeIn result
    in analyseStms lumap used' stms
 
