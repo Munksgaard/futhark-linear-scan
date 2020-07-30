@@ -2,6 +2,7 @@ module Main (main) where
 
 import Control.Category ((>>>))
 import Futhark.Actions (printAction)
+import Futhark.Analysis.Interference (interference)
 import Futhark.Compiler
   ( newFutharkConfig,
     runCompilerOnProgram,
@@ -9,7 +10,6 @@ import Futhark.Compiler
 import Futhark.IR.KernelsMem (KernelsMem)
 import Futhark.IR.SOACS
 import Futhark.Optimise.CSE
-import Futhark.Optimise.ReuseAllocations (interference, reuseAllocations)
 import qualified Futhark.Pass.ExplicitAllocations.Kernels as Kernels
 import Futhark.Pass.Simplify
 import Futhark.Passes (kernelsPipeline)

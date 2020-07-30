@@ -1,9 +1,7 @@
--- type vec = (f32, f32, f32, f32)
-
--- let vecadd (a: vec) (b: vec) =
---   (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3)
-
--- let psum = scan vecadd (0,0,0,0)
+-- ==
+-- random input { [100][10]i32 }
+-- auto output
+-- structure gpu { Alloc 3 }
 
 let psum = scan (+) 0
 
