@@ -13,5 +13,6 @@ pkgs.mkShell {
     ormolu.ormolu
     pkgs.ocl-icd
     pkgs.opencl-headers
+    pkgs.ghcid
   ];
 }
