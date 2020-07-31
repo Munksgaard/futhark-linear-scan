@@ -3,7 +3,7 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Futhark.Analysis.Interference (interference) where
+module Futhark.Analysis.Interference (interference, analyse) where
 
 import Control.Monad.Reader
 import Data.Foldable (foldlM, toList)
@@ -177,6 +177,12 @@ analyseKernels lumap stms =
         analyseKernels lumap $ bodyStms body
     helper stm =
       inScopeOf stm $ return mempty
+
+analyse :: Prog KernelsMem -> Graph
+analyse prog =
+  let (lumap, used) = LastUse.analyseProg prog
+      (_, _, graph) = foldMap (\f -> runReader (analyseKernels lumap (bodyStms $ funDefBody f)) $ scopeOf f) $ progFuns prog
+   in graph
 
 interference :: Action KernelsMem
 interference =

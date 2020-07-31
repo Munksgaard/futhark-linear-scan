@@ -1,7 +1,6 @@
 module Main (main) where
 
 import Control.Category ((>>>))
-import Futhark.Actions (printAction)
 import Futhark.Analysis.Interference (interference)
 import Futhark.Compiler
   ( newFutharkConfig,

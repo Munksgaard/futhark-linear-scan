@@ -19,7 +19,7 @@ lastUseAction :: Action KernelsMem
 lastUseAction =
   Action
     { actionName = "memory allocation lastUse analysis",
-      actionDescription = "Perform lastUse analysis on memory allocations",
+      actionDescription = "Perform last use analysis on memory allocations",
       actionProcedure = analyseAndPrint
     }
   where
