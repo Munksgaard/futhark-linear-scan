@@ -7,9 +7,6 @@ module Futhark.Analysis.InterferenceTests
 where
 
 import Control.Category ((>>>))
-import Control.Monad
-import Control.Monad.Reader
-import Control.Monad.State
 import qualified Data.Set as Set
 import qualified Futhark.Analysis.Interference as Interference
 import Futhark.Compiler
