@@ -21,6 +21,7 @@ library
   exposed-modules:
     Futhark.Analysis.Interference
     Futhark.Analysis.LastUse
+    Futhark.Optimise.ReuseAllocations.GreedyColoring
     -- Futhark.Optimise.ReuseAllocations
   hs-source-dirs:
       src
@@ -47,6 +48,7 @@ test-suite unit
   main-is: Tests.hs
   other-modules:
     Futhark.Analysis.InterferenceTests
+    Futhark.Optimise.ReuseAllocations.GreedyColoringTests
   hs-source-dirs:
     unittests
   ghc-options: -Wall -Wcompat -Wredundant-constraints -Wincomplete-record-updates -Wmissing-export-lists
