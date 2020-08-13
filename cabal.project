@@ -1,0 +1,6 @@
+packages: .
+
+source-repository-package
+    type: git
+    location: https://github.com/diku-dk/futhark.git
+    tag: 7ee5fc3d44c37bb1ff96a82a44664f19582def4b
