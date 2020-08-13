@@ -2,7 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Futhark.Analysis.Interference (interference, analyse) where
+module Futhark.Analysis.Interference (interference, analyse, Graph) where
 
 import Control.Monad.Reader
 import Data.Foldable (toList)
@@ -23,19 +23,19 @@ type LastUsed = Names
 
 type InterferenceM = Reader (Scope KernelsMem)
 
-type Graph = Set (VName, VName)
+type Graph a = Set (a, a)
 
-insertEdge :: VName -> VName -> Graph -> Graph
+insertEdge :: Ord a => a -> a -> Graph a -> Graph a
 insertEdge v1 v2 g
   | v1 == v2 = g
   | otherwise = Set.insert (min v1 v2, max v1 v2) g
 
-cartesian :: Names -> Names -> Graph
+cartesian :: Names -> Names -> Graph VName
 cartesian ns1 ns2 =
   [(min x y, max x y) | x <- namesToList ns1, y <- namesToList ns2]
     & foldr (uncurry insertEdge) mempty
 
-analyseStm :: LastUseMap -> InUse -> Stm KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseStm :: LastUseMap -> InUse -> Stm KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseStm lumap inuse0 stm =
   inScopeOf stm $ do
     let pat_name = patElemName $ head $ patternValueElements $ stmPattern stm
@@ -71,7 +71,7 @@ analyseStm lumap inuse0 stm =
         graph <> (inuse_outside `cartesian` (inuse_outside <> inuse <> lus <> last_use_mems))
       )
 
-analyseExp :: LastUseMap -> InUse -> Exp KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseExp :: LastUseMap -> InUse -> Exp KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseExp lumap inuse_outside expr =
   case expr of
     If _ then_body else_body _ -> do
@@ -85,13 +85,13 @@ analyseExp lumap inuse_outside expr =
     _ ->
       return mempty
 
-analyseKernelBody :: LastUseMap -> InUse -> KernelBody KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseKernelBody :: LastUseMap -> InUse -> KernelBody KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseKernelBody lumap inuse body = analyseStms lumap inuse $ kernelBodyStms body
 
-analyseBody :: LastUseMap -> InUse -> Body KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseBody :: LastUseMap -> InUse -> Body KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseBody lumap inuse body = analyseStms lumap inuse $ bodyStms body
 
-analyseStms :: LastUseMap -> InUse -> Stms KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseStms :: LastUseMap -> InUse -> Stms KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseStms lumap inuse0 stms = do
   inScopeOf stms $ do
     foldM
@@ -102,7 +102,7 @@ analyseStms lumap inuse0 stms = do
       (inuse0, mempty, mempty)
       $ stmsToList stms
 
-analyseSegOp :: LastUseMap -> InUse -> SegOp lvl KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseSegOp :: LastUseMap -> InUse -> SegOp lvl KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseSegOp lumap inuse (SegMap _ _ _ body) =
   analyseKernelBody lumap inuse body
 analyseSegOp lumap inuse (SegRed _ _ binops _ body) =
@@ -114,29 +114,29 @@ analyseSegOp lumap inuse (SegHist _ _ histops _ body) = do
   (inuse'', lus'', graph') <- mconcat <$> mapM (analyseHistOp lumap inuse') histops
   return (inuse'', lus' <> lus'', graph <> graph')
 
-segWithBinOps :: LastUseMap -> InUse -> [SegBinOp KernelsMem] -> KernelBody KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+segWithBinOps :: LastUseMap -> InUse -> [SegBinOp KernelsMem] -> KernelBody KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 segWithBinOps lumap inuse binops body = do
   (inuse', lus', graph) <- analyseKernelBody lumap inuse body
   (inuse'', lus'', graph') <- mconcat <$> mapM (analyseSegBinOp lumap inuse') binops
   return (inuse'', lus' <> lus'', graph <> graph')
 
-analyseSegBinOp :: LastUseMap -> InUse -> SegBinOp KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseSegBinOp :: LastUseMap -> InUse -> SegBinOp KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseSegBinOp lumap inuse (SegBinOp _ lambda _ _) =
   analyseLambda lumap inuse lambda
 
-analyseHistOp :: LastUseMap -> InUse -> HistOp KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseHistOp :: LastUseMap -> InUse -> HistOp KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseHistOp lumap inuse histop =
   analyseLambda lumap inuse (histOp histop)
 
-analyseLambda :: LastUseMap -> InUse -> Lambda KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseLambda :: LastUseMap -> InUse -> Lambda KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseLambda lumap inuse (Lambda _ body _) =
   analyseBody lumap inuse body
 
-analyseKernels :: LastUseMap -> Stms KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+analyseKernels :: LastUseMap -> Stms KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
 analyseKernels lumap stms =
   mconcat . toList <$> mapM helper stms
   where
-    helper :: Stm KernelsMem -> InterferenceM (InUse, LastUsed, Graph)
+    helper :: Stm KernelsMem -> InterferenceM (InUse, LastUsed, Graph VName)
     helper stm@Let {stmExp = Op (Inner (SegOp segop))} =
       inScopeOf stm $ analyseSegOp lumap mempty segop
     helper stm@Let {stmExp = If _ then_body else_body _} =
@@ -150,7 +150,7 @@ analyseKernels lumap stms =
     helper stm =
       inScopeOf stm $ return mempty
 
-analyse :: Prog KernelsMem -> Graph
+analyse :: Prog KernelsMem -> Graph VName
 analyse prog =
   let (lumap, _) = LastUse.analyseProg prog
       (_, _, graph) = foldMap (\f -> runReader (analyseKernels lumap (bodyStms $ funDefBody f)) $ scopeOf f) $ progFuns prog
