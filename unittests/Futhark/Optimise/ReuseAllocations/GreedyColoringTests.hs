@@ -13,7 +13,7 @@ tests :: TestTree
 tests =
   testGroup
     "GreedyColoringTests"
-    [psumTest]
+    [psumTest, allIntersect, emptyGraph]
 
 psumTest :: TestTree
 psumTest =
@@ -22,3 +22,19 @@ psumTest =
       "Color simple 1-2-3 using two colors"
       [(1 :: Int, 0), (2, 1), (3, 0)]
       $ Map.toList $ GreedyColoring.colorGraph $ Set.fromList [(1, 2), (2, 3)]
+
+allIntersect :: TestTree
+allIntersect =
+  testCase "allIntersect" $ do
+    assertEqual
+      "Color a graph where all values intersect"
+      [(1 :: Int, 2), (2, 1), (3, 0)]
+      $ Map.toList $ GreedyColoring.colorGraph $ Set.fromList [(1, 2), (2, 3), (1, 3)]
+
+emptyGraph :: TestTree
+emptyGraph =
+  testCase "emptyGraph" $ do
+    assertEqual
+      "Color an empty graph"
+      ([] :: [(Int, Int)])
+      $ Map.toList $ GreedyColoring.colorGraph $ Set.fromList []
