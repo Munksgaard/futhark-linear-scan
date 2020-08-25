@@ -9,10 +9,13 @@ pkgs.mkShell {
     pkgs.cabal-install
     pkgs.haskell.compiler.ghc8101
     pkgs.zlib
+    pkgs.zlib.dev
+    pkgs.zlib.out
     pkgs.hlint
     ormolu.ormolu
     pkgs.ocl-icd
     pkgs.opencl-headers
     pkgs.ghcid
+    pkgs.pkgconfig
   ];
 }
