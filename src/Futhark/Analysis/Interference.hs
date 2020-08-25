@@ -2,7 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Futhark.Analysis.Interference (interference, analyse, Graph) where
+module Futhark.Analysis.Interference (analyse, analyseSegOp, Graph, analyseKernels) where
 
 import Control.Monad.Reader
 import Data.Foldable (toList)
@@ -15,7 +15,6 @@ import Data.Set (Set)
 import qualified Futhark.Analysis.LastUse as LastUse
 import Futhark.Analysis.LastUse (LastUseMap)
 import Futhark.IR.KernelsMem
-import Futhark.Pipeline
 
 type InUse = Names
 
@@ -155,23 +154,6 @@ analyse prog =
   let (lumap, _) = LastUse.analyseProg prog
       (_, _, graph) = foldMap (\f -> runReader (analyseKernels lumap (bodyStms $ funDefBody f)) $ scopeOf f) $ progFuns prog
    in graph
-
-interference :: Action KernelsMem
-interference =
-  Action
-    { actionName = "memory interference graph",
-      actionDescription = "Analyse interference",
-      actionProcedure = helper
-    }
-  where
-    helper :: Prog KernelsMem -> FutharkM ()
-    helper prog = do
-      let (lumap, _) = LastUse.analyseProg prog
-      liftIO $ putStrLn ("lumap: " ++ pretty lumap ++ "\n")
-      let (inuse, lastused, graph) = foldMap (\f -> runReader (analyseKernels lumap (bodyStms $ funDefBody f)) $ scopeOf f) $ progFuns prog
-      liftIO $ putStrLn ("inuse: " ++ pretty inuse ++ "\n")
-      liftIO $ putStrLn ("lastused: " ++ pretty lastused ++ "\n")
-      liftIO $ putStrLn ("graph: " ++ pretty graph ++ "\n")
 
 nameInfoToMemInfo :: Mem lore => NameInfo lore -> MemBound NoUniqueness
 nameInfoToMemInfo info =
