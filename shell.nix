@@ -3,8 +3,6 @@ let
   sources = import ./nix/sources.nix;
   pkgs = import sources.nixpkgs {};
   ormolu = import sources.ormolu {};
-in
-pkgs.mkShell {
   buildInputs = [
     pkgs.cabal-install
     pkgs.haskell.compiler.ghc8101
@@ -17,5 +15,12 @@ pkgs.mkShell {
     pkgs.opencl-headers
     pkgs.ghcid
     pkgs.pkgconfig
+    pkgs.gmp
+    pkgs.libffi
   ];
+in
+pkgs.mkShell {
+  buildInputs = buildInputs;
+
+  shellHook = ''export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath buildInputs}:$LD_LIBRARY_PATH'';
 }
