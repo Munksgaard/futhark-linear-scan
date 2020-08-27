@@ -41,27 +41,15 @@ getAllocsStm (Let _ _ (DoLoop _ _ _ body)) =
   foldMap getAllocsStm (bodyStms body)
 getAllocsStm _ = mempty
 
-getAllocsLambda :: Lambda KernelsMem -> Allocs
-getAllocsLambda (Lambda _ body _) =
-  foldMap getAllocsStm $ bodyStms body
-
-getAllocsSegBinOp :: SegBinOp KernelsMem -> Allocs
-getAllocsSegBinOp (SegBinOp _ lambda _ _) =
-  getAllocsLambda lambda
-
-getAllocsHistOp :: HistOp KernelsMem -> Allocs
-getAllocsHistOp (HistOp _ _ _ _ _ histop) =
-  getAllocsLambda histop
-
 getAllocsSegOp :: SegOp lvl KernelsMem -> Allocs
 getAllocsSegOp (SegMap _ _ _ body) =
   foldMap getAllocsStm (kernelBodyStms body)
-getAllocsSegOp (SegRed _ _ segbinops _ body) =
-  foldMap getAllocsStm (kernelBodyStms body) <> foldMap getAllocsSegBinOp segbinops
-getAllocsSegOp (SegScan _ _ segbinops _ body) =
-  foldMap getAllocsStm (kernelBodyStms body) <> foldMap getAllocsSegBinOp segbinops
-getAllocsSegOp (SegHist _ _ histops _ body) =
-  foldMap getAllocsStm (kernelBodyStms body) <> foldMap getAllocsHistOp histops
+getAllocsSegOp (SegRed _ _ _ _ body) =
+  foldMap getAllocsStm (kernelBodyStms body)
+getAllocsSegOp (SegScan _ _ _ _ body) =
+  foldMap getAllocsStm (kernelBodyStms body)
+getAllocsSegOp (SegHist _ _ _ _ body) =
+  foldMap getAllocsStm (kernelBodyStms body)
 
 setAllocsStm :: Map VName SubExp -> Stm KernelsMem -> Stm KernelsMem
 setAllocsStm m stm@(Let (Pattern [] [PatElem name _]) _ (Op (Alloc _ _)))
@@ -90,29 +78,17 @@ setAllocsStm m stm@(Let _ _ (DoLoop ctx vals form body)) =
     }
 setAllocsStm _ stm = stm
 
-setAllocsLambda :: Map VName SubExp -> Lambda KernelsMem -> Lambda KernelsMem
-setAllocsLambda m lambda@(Lambda _ body _) =
-  lambda {lambdaBody = body {bodyStms = fmap (setAllocsStm m) $ bodyStms body}}
-
-setAllocsSegBinOp :: Map VName SubExp -> SegBinOp KernelsMem -> SegBinOp KernelsMem
-setAllocsSegBinOp m segbinop =
-  segbinop {segBinOpLambda = setAllocsLambda m $ segBinOpLambda segbinop}
-
-setAllocsHistOp :: Map VName SubExp -> HistOp KernelsMem -> HistOp KernelsMem
-setAllocsHistOp m hop =
-  hop {histOp = setAllocsLambda m $ histOp hop}
-
 setAllocsSegOp :: Map VName SubExp -> SegOp lvl KernelsMem -> SegOp lvl KernelsMem
 setAllocsSegOp m (SegMap lvl sp tps body) =
   SegMap lvl sp tps $ body {kernelBodyStms = fmap (setAllocsStm m) $ kernelBodyStms body}
 setAllocsSegOp m (SegRed lvl sp segbinops tps body) =
-  SegRed lvl sp (fmap (setAllocsSegBinOp m) segbinops) tps $
+  SegRed lvl sp segbinops tps $
     body {kernelBodyStms = fmap (setAllocsStm m) $ kernelBodyStms body}
 setAllocsSegOp m (SegScan lvl sp segbinops tps body) =
-  SegScan lvl sp (fmap (setAllocsSegBinOp m) segbinops) tps $
+  SegScan lvl sp segbinops tps $
     body {kernelBodyStms = fmap (setAllocsStm m) $ kernelBodyStms body}
 setAllocsSegOp m (SegHist lvl sp segbinops tps body) =
-  SegHist lvl sp (fmap (setAllocsHistOp m) segbinops) tps $
+  SegHist lvl sp segbinops tps $
     body {kernelBodyStms = fmap (setAllocsStm m) $ kernelBodyStms body}
 
 invertMap :: (Ord v, Ord k) => Map k v -> Map v (Set k)
@@ -140,7 +116,9 @@ optimiseKernel graph segop = do
   let segop' = setAllocsSegOp ((fmap (colors !!) coloring)) segop
   return $ case segop' of
     SegMap lvl sp tps body -> SegMap lvl sp tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
-    _ -> undefined
+    SegRed lvl sp binops tps body -> SegRed lvl sp binops tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
+    SegScan lvl sp binops tps body -> SegScan lvl sp binops tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
+    SegHist lvl sp binops tps body -> SegHist lvl sp binops tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
 
 onKernels :: (SegOp SegLevel KernelsMem -> ReuseAllocsM (SegOp SegLevel KernelsMem)) -> Stms KernelsMem -> ReuseAllocsM (Stms KernelsMem)
 onKernels f stms =
