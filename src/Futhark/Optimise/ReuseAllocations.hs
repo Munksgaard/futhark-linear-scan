@@ -6,6 +6,7 @@
 module Futhark.Optimise.ReuseAllocations (optimise) where
 
 import Control.Arrow (first)
+import Control.Exception
 import Control.Monad.Reader
 import Control.Monad.State.Strict
 import Data.Function ((&))
@@ -138,8 +139,7 @@ optimiseKernel graph segop = do
   let allocs = traceWith "allocs" $ getAllocsSegOp segop
       (colorspaces, coloring) = GreedyColoring.colorGraph (traceWith "spacemap" $ fmap snd allocs) $ traceWith "graph" graph
   maxes <- mapM (maxSubExp . Set.map (fst . (allocs !) . traceWith "look up")) $ Map.elems $ traceWith "inverted coloring" $ invertMap $ traceWith "coloring" coloring
-  -- assert (length maxes == Map.size colorspaces)
-  (colors, stms) <- collectStms $ mapM (\(i, x) -> letSubExp "color" $ Op $ Alloc x $ colorspaces ! i) $ zip [0 ..] $ traceWith "maxes" maxes
+  (colors, stms) <- collectStms $ mapM (\(i, x) -> letSubExp "color" $ Op $ Alloc x $ colorspaces ! i) $ zip [0 ..] $ assert (length maxes == Map.size colorspaces) $ traceWith "maxes" maxes
   let segop' = setAllocsSegOp (traceWith "mapping" (fmap (colors !!) coloring)) segop
   return $ case segop' of
     SegMap lvl sp tps body -> SegMap lvl sp tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
