@@ -111,14 +111,14 @@ optimiseKernel :: Interference.Graph VName -> SegOp lvl KernelsMem -> ReuseAlloc
 optimiseKernel graph segop = do
   let allocs = getAllocsSegOp segop
       (colorspaces, coloring) = GreedyColoring.colorGraph (fmap snd allocs) graph
-  maxes <- mapM (maxSubExp . Set.map (fst . (allocs !))) $ Map.elems $ invertMap coloring
+  (maxes, maxstms) <- collectStms $ mapM (maxSubExp . Set.map (fst . (allocs !))) $ Map.elems $ invertMap coloring
   (colors, stms) <- collectStms $ mapM (\(i, x) -> letSubExp "color" $ Op $ Alloc x $ colorspaces ! i) $ zip [0 ..] $ assert (length maxes == Map.size colorspaces) maxes
   let segop' = setAllocsSegOp ((fmap (colors !!) coloring)) segop
   return $ case segop' of
-    SegMap lvl sp tps body -> SegMap lvl sp tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
-    SegRed lvl sp binops tps body -> SegRed lvl sp binops tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
-    SegScan lvl sp binops tps body -> SegScan lvl sp binops tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
-    SegHist lvl sp binops tps body -> SegHist lvl sp binops tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
+    SegMap lvl sp tps body -> SegMap lvl sp tps $ body {kernelBodyStms = maxstms <> stms <> kernelBodyStms body}
+    SegRed lvl sp binops tps body -> SegRed lvl sp binops tps $ body {kernelBodyStms = maxstms <> stms <> kernelBodyStms body}
+    SegScan lvl sp binops tps body -> SegScan lvl sp binops tps $ body {kernelBodyStms = maxstms <> stms <> kernelBodyStms body}
+    SegHist lvl sp binops tps body -> SegHist lvl sp binops tps $ body {kernelBodyStms = maxstms <> stms <> kernelBodyStms body}
 
 onKernels :: (SegOp SegLevel KernelsMem -> ReuseAllocsM (SegOp SegLevel KernelsMem)) -> Stms KernelsMem -> ReuseAllocsM (Stms KernelsMem)
 onKernels f stms =
