@@ -2,7 +2,8 @@ module Futhark.Optimise.ReuseAllocations.GreedyColoring (colorGraph, Coloring) w
 
 import Data.Function ((&))
 import qualified Data.Map as Map
-import Data.Map (Map, (!), (!?))
+import Data.Map (Map, (!?))
+import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import qualified Futhark.Analysis.Interference as Interference
@@ -22,19 +23,21 @@ neighbors graph =
     Map.empty
     graph
 
-firstAvailable :: Set Int -> Int -> Int
-firstAvailable xs i =
-  if i `Set.member` xs
-    then firstAvailable xs $ i + 1
-    else i
+firstAvailable :: Eq space => Map Int space -> Set Int -> Int -> space -> (Map Int space, Int)
+firstAvailable spaces xs i sp =
+  case (i `Set.member` xs, spaces !? i) of
+    (False, Just sp') | sp' == sp -> (spaces, i)
+    (False, Nothing) -> (Map.insert i sp spaces, i)
+    _ -> firstAvailable spaces xs (i + 1) sp
 
-colorNode :: Ord a => Neighbors a -> a -> Coloring a -> Coloring a
-colorNode nbs x coloring =
-  let nb_colors = foldMap (maybe Set.empty Set.singleton . (coloring !?)) $ nbs ! x
-   in Map.insert x (firstAvailable nb_colors 0) coloring
+colorNode :: (Ord a, Eq space) => Neighbors a -> (a, space) -> (Map Int space, Coloring a) -> (Map Int space, Coloring a)
+colorNode nbs (x, sp) (spaces, coloring) =
+  let nb_colors = foldMap (maybe Set.empty Set.singleton . (coloring !?)) $ fromMaybe mempty (nbs !? x)
+      (spaces', color) = firstAvailable spaces nb_colors 0 sp
+   in (spaces', Map.insert x color coloring)
 
-colorGraph :: Ord a => Interference.Graph a -> Coloring a
-colorGraph graph =
-  let nodes = Set.foldr (\(x, y) acc -> Set.insert x $ Set.insert y acc) Set.empty graph
+colorGraph :: (Ord a, Ord space) => Map a space -> Interference.Graph a -> (Map Int space, Coloring a)
+colorGraph spaces graph =
+  let nodes = Set.fromList $ Map.toList spaces
       nbs = neighbors graph
-   in Set.foldr (colorNode nbs) Map.empty nodes
+   in Set.foldr (colorNode nbs) mempty nodes

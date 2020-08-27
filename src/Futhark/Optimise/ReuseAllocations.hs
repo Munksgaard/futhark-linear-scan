@@ -3,295 +3,188 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE TypeFamilies #-}
 
-module Futhark.Optimise.ReuseAllocations (interference) where
+module Futhark.Optimise.ReuseAllocations (optimise) where
 
+import Control.Arrow (first)
 import Control.Monad.Reader
-import Data.Foldable (foldlM, toList)
+import Control.Monad.State.Strict
 import Data.Function ((&))
-import Data.Functor ((<&>))
-import qualified Data.List as List
 import qualified Data.Map as Map
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Map (Map, (!))
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.Tuple (swap)
 import Debug.Trace
-import qualified Futhark.Analysis.Alias as Alias
+import qualified Futhark.Analysis.Interference as Interference
 import qualified Futhark.Analysis.LastUse as LastUse
-import Futhark.Analysis.LastUse (LastUseMap)
+import Futhark.Binder.Class
+import Futhark.Construct
 import Futhark.IR.KernelsMem
-import Futhark.IR.Prop.Names
-import Futhark.Pass (Pass (..), intraproceduralTransformation)
-import Futhark.Pipeline
+import qualified Futhark.Optimise.ReuseAllocations.GreedyColoring as GreedyColoring
+import qualified Futhark.Pass as Pass
+import Futhark.Pass (Pass (..), PassM)
 
-type InUse = Names
+type Allocs = Map VName (SubExp, Space)
 
-type LastUsed = Names
+-- type ReuseAllocsM = ReaderT (Scope KernelsMem) (Reader VNameSource)
 
-type Graph = Set (VName, VName)
+type ReuseAllocsM = Binder KernelsMem
 
-type Frees = [(VName, SubExp)]
+getAllocsStm :: Stm KernelsMem -> Allocs
+getAllocsStm (Let (Pattern [] [PatElem name _]) _ (Op (Alloc se sp))) =
+  Map.singleton name (se, sp)
+getAllocsStm (Let _ _ (Op (Alloc _ _))) = error "impossible"
+getAllocsStm (Let _ _ (Op (Inner (SegOp segop)))) = getAllocsSegOp segop
+getAllocsStm (Let _ _ (If _ then_body else_body _)) =
+  foldMap getAllocsStm (bodyStms then_body) <> foldMap getAllocsStm (bodyStms else_body)
+getAllocsStm (Let _ _ (DoLoop _ _ _ body)) =
+  foldMap getAllocsStm (bodyStms body)
+getAllocsStm _ = mempty
 
-type Allocs = [(VName, SubExp)]
+getAllocsLambda :: Lambda KernelsMem -> Allocs
+getAllocsLambda (Lambda _ body _) =
+  foldMap getAllocsStm $ bodyStms body
 
-type ReuseAllocsM = Reader (Scope KernelsMem)
+getAllocsSegBinOp :: SegBinOp KernelsMem -> Allocs
+getAllocsSegBinOp (SegBinOp _ lambda _ _) =
+  getAllocsLambda lambda
 
-traceWith s p a = trace (s ++ " (" ++ pretty p ++ "): " ++ pretty a) a
+getAllocsHistOp :: HistOp KernelsMem -> Allocs
+getAllocsHistOp (HistOp _ _ _ _ _ histop) =
+  getAllocsLambda histop
 
-insertEdge :: VName -> VName -> Graph -> Graph
-insertEdge v1 v2 g
-  | v1 == v2 = g
-  | otherwise = Set.insert (min v1 v2, max v1 v2) g
+getAllocsSegOp :: SegOp lvl KernelsMem -> Allocs
+getAllocsSegOp (SegMap _ _ _ body) =
+  foldMap getAllocsStm (kernelBodyStms body)
+getAllocsSegOp (SegRed _ _ segbinops _ body) =
+  foldMap getAllocsStm (kernelBodyStms body) <> foldMap getAllocsSegBinOp segbinops
+getAllocsSegOp (SegScan _ _ segbinops _ body) =
+  foldMap getAllocsStm (kernelBodyStms body) <> foldMap getAllocsSegBinOp segbinops
+getAllocsSegOp (SegHist _ _ histops _ body) =
+  foldMap getAllocsStm (kernelBodyStms body) <> foldMap getAllocsHistOp histops
 
-cartesian :: Names -> Names -> Graph
-cartesian ns1 ns2 =
-  [(min x y, max x y) | x <- namesToList ns1, y <- namesToList ns2]
-    & foldr (uncurry insertEdge) mempty
-
-analyseStm :: LastUseMap -> InUse -> Graph -> Stm KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
-analyseStm lumap inuse0 graph0 stm = do
-  out_scope <- askScope
-  let pat_name = patElemName $ head $ patternValueElements $ stmPattern $ stm
-
-  lus0 <-
-    Map.lookup pat_name lumap
-      & fromMaybe mempty
-      & namesToList
-      & mapM memInfo
-      <&> catMaybes
-      <&> namesFromList
-
-  localScope (scopeOf stm) $ do
-    inner_scope <- askScope
-    mems <-
-      stmPattern stm
-        & patternValueElements
-        & mapM (memInfo . patElemName)
-        <&> catMaybes
-    let inuse = inuse0 <> namesFromList mems
-    let graph = graph0 <> (inuse `cartesian` inuse)
-
-    case stmExp stm of
-      If cse then_body else_body dec -> do
-        (inuse1, lus1, g1) <- analyseBody lumap then_body
-        (inuse2, lus2, g2) <- analyseBody lumap else_body
-        let lus = lus0 <> lus1 <> lus2
-            inuse' = (inuse <> inuse1 <> inuse2) `namesSubtract` lus
-            g =
-              graph <> g1 <> g2
-                <> ((inuse1 <> lus1) `cartesian` (inuse0 `namesSubtract` (lus2 `namesSubtract` lus1)))
-                <> ((inuse2 <> lus2) `cartesian` (inuse0 `namesSubtract` (lus1 `namesSubtract` lus2)))
-        return $ trace (unwords ["If", pretty pat_name, "inuse':", pretty inuse', "lus:", pretty lus, "lus0:", pretty lus0, "\nout_scope:", show out_scope, "\ninner_scope:", show inner_scope]) (inuse', lus, g)
-      Apply _ _ _ _ -> do
-        let inuse' = inuse `namesSubtract` lus0
-        return $ traceWith "Apply" pat_name (inuse', lus0, graph)
-      BasicOp _ -> do
-        let inuse' = inuse `namesSubtract` lus0
-        return $ traceWith "BasicOp" pat_name (inuse', lus0, graph)
-      DoLoop ctx vals form body -> do
-        (inuse', lus, graph') <- analyseBody lumap body
-        let lus' = lus <> lus0
-        let graph'' = graph <> graph' <> inuse `cartesian` (inuse' <> lus')
-        let inuse'' = inuse `namesSubtract` lus <> inuse'
-        return $ traceWith "DoLoop" pat_name (inuse'', lus', graph'')
-      Op (Inner (SegOp (SegMap lvl _ tps body))) -> do
-        (inuse', lus, graph') <- analyseKernelBody lumap body
-        let lus' = lus <> lus0
-        let graph'' = graph <> graph' <> inuse `cartesian` (inuse' <> lus')
-        let inuse'' = inuse `namesSubtract` lus <> inuse'
-        return $ traceWith "SegMap" pat_name (inuse'', lus', graph'')
-      Op (Inner (SegOp (SegRed lvl _ binops tps body))) -> do
-        undefined
-      Op (Inner (SegOp (SegScan lvl _ binops tps body))) -> do
-        undefined
-      Op (Inner (SegOp (SegHist lvl _ histops tps body))) -> do
-        undefined
-      Op (Inner (SizeOp _)) -> do
-        undefined
-      Op (Inner (OtherOp _)) -> do
-        undefined
-      Op (Alloc _ _) -> do
-        let inuse' = inuse `namesSubtract` lus0
-        return $ traceWith "Alloc" pat_name (inuse', lus0, graph)
-
-analyseKernelBody :: LastUseMap -> KernelBody KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
-analyseKernelBody lumap body = analyseStms lumap $ kernelBodyStms body
-
-analyseBody :: LastUseMap -> Body KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
-analyseBody lumap body = analyseStms lumap $ bodyStms body
-
-analyseStms :: LastUseMap -> Stms KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
-analyseStms lumap stms = do
-  inScopeOf stms $ do
-    foldM
-      ( \(inuse, lus, graph) stm -> do
-          (inuse', lus', graph') <- analyseStm lumap inuse graph stm
-          return (inuse', lus' <> lus, graph')
-      )
-      (mempty, mempty, mempty)
-      $ stmsToList stms
-
-analyseKernels :: LastUseMap -> Stms KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
-analyseKernels lumap stms =
-  (mconcat . toList) <$> mapM helper stms
-  where
-    helper :: Stm KernelsMem -> ReuseAllocsM (InUse, LastUsed, Graph)
-    helper stm@Let {stmExp = Op (Inner (SegOp segop))} =
-      undefined
-    helper stm@Let {stmExp = If _ then_body else_body _} =
-      undefined
-    helper stm@Let {stmExp = DoLoop _ _ _ body} =
-      undefined
-
-interference :: Action KernelsMem
-interference =
-  Action
-    { actionName = "memory interference graph",
-      actionDescription = "Analyse interference",
-      actionProcedure = helper
+setAllocsStm :: Map VName SubExp -> Stm KernelsMem -> Stm KernelsMem
+setAllocsStm m stm@(Let (Pattern [] [PatElem name _]) _ (Op (Alloc _ _)))
+  | Just s <- Map.lookup name m =
+    stm {stmExp = BasicOp $ SubExp s}
+setAllocsStm _ (Let _ _ (Op (Alloc _ _))) = error "impossible"
+setAllocsStm m stm@(Let _ _ (Op (Inner (SegOp segop)))) =
+  stm {stmExp = Op $ Inner $ SegOp $ setAllocsSegOp m segop}
+setAllocsStm m stm@(Let _ _ (If cse then_body else_body dec)) =
+  stm
+    { stmExp =
+        If
+          cse
+          (then_body {bodyStms = fmap (setAllocsStm m) $ bodyStms then_body})
+          (else_body {bodyStms = fmap (setAllocsStm m) $ bodyStms else_body})
+          dec
     }
+setAllocsStm m stm@(Let _ _ (DoLoop ctx vals form body)) =
+  stm
+    { stmExp =
+        DoLoop
+          ctx
+          vals
+          form
+          (body {bodyStms = fmap (setAllocsStm m) $ bodyStms body})
+    }
+setAllocsStm _ stm = stm
+
+setAllocsLambda :: Map VName SubExp -> Lambda KernelsMem -> Lambda KernelsMem
+setAllocsLambda m lambda@(Lambda _ body _) =
+  lambda {lambdaBody = body {bodyStms = fmap (setAllocsStm m) $ bodyStms body}}
+
+setAllocsSegBinOp :: Map VName SubExp -> SegBinOp KernelsMem -> SegBinOp KernelsMem
+setAllocsSegBinOp m segbinop =
+  segbinop {segBinOpLambda = setAllocsLambda m $ segBinOpLambda segbinop}
+
+setAllocsHistOp :: Map VName SubExp -> HistOp KernelsMem -> HistOp KernelsMem
+setAllocsHistOp m hop =
+  hop {histOp = setAllocsLambda m $ histOp hop}
+
+setAllocsSegOp :: Map VName SubExp -> SegOp lvl KernelsMem -> SegOp lvl KernelsMem
+setAllocsSegOp m (SegMap lvl sp tps body) =
+  SegMap lvl sp tps $ body {kernelBodyStms = fmap (setAllocsStm m) $ kernelBodyStms body}
+setAllocsSegOp m (SegRed lvl sp segbinops tps body) =
+  SegRed lvl sp (fmap (setAllocsSegBinOp m) segbinops) tps $
+    body {kernelBodyStms = fmap (setAllocsStm m) $ kernelBodyStms body}
+setAllocsSegOp m (SegScan lvl sp segbinops tps body) =
+  SegScan lvl sp (fmap (setAllocsSegBinOp m) segbinops) tps $
+    body {kernelBodyStms = fmap (setAllocsStm m) $ kernelBodyStms body}
+setAllocsSegOp m (SegHist lvl sp segbinops tps body) =
+  SegHist lvl sp (fmap (setAllocsHistOp m) segbinops) tps $
+    body {kernelBodyStms = fmap (setAllocsStm m) $ kernelBodyStms body}
+
+invertMap :: (Ord v, Ord k) => Map k v -> Map v (Set k)
+invertMap m =
+  Map.toList m
+    & fmap (swap . first Set.singleton)
+    & foldr (uncurry $ Map.insertWith (<>)) mempty
+
+maxSubExp :: Set SubExp -> ReuseAllocsM SubExp
+maxSubExp = helper . Set.toList
   where
-    helper :: Prog KernelsMem -> FutharkM ()
-    helper prog = do
-      let (lumap, used) = LastUse.analyseProg prog
-      liftIO $ putStrLn ("lumap: " ++ pretty lumap ++ "\n")
-      let (inuse, lastused, graph) = foldMap (\f -> runReader (analyseKernels mempty (bodyStms $ funDefBody f)) $ scopeOf f) $ progFuns prog
-      liftIO $ putStrLn ("inuse: " ++ pretty inuse ++ "\n")
-      liftIO $ putStrLn ("lastused: " ++ pretty lastused ++ "\n")
-      liftIO $ putStrLn ("graph: " ++ pretty graph ++ "\n")
+    helper (s1 : s2 : sexps) = do
+      z <- letSubExp "maxSubHelper" $ BasicOp $ BinOp (UMax Int64) s1 s2
+      helper (z : sexps)
+    helper [s] =
+      return s
+    helper [] = error "impossible"
 
--- let (inuse, lastused, graph) = runReader (analyseBody lumap (funDefBody fun)) $ scopeOf fun
--- liftIO $ putStrLn ""
--- liftIO $ putStrLn $ unlines $ fmap (\(x, y) -> pretty x ++ " <-> " ++ pretty y) $ Set.toList graph
--- liftIO $ putStrLn ""
--- liftIO $ putStrLn $ unlines $ fmap pretty $ namesToList inuse
--- liftIO $ putStrLn ""
--- liftIO $ putStrLn $ unlines $ fmap pretty $ namesToList lastused
+traceWith s a = trace (s ++ ": " ++ pretty a) a
 
--- reuseAllocations :: Pass KernelsMem KernelsMem
--- reuseAllocations =
---   Pass
---     { passName = "reuse allocations",
---       passDescription = "reuse allocations in all functions",
---       passFunction = intraproceduralTransformation helper
---     }
---   where
---     helper scope stms =
---       return $ runReader (optimise stms) scope
+optimiseKernel :: Interference.Graph VName -> SegOp lvl KernelsMem -> ReuseAllocsM (SegOp lvl KernelsMem)
+optimiseKernel graph segop = do
+  let allocs = traceWith "allocs" $ getAllocsSegOp segop
+      (colorspaces, coloring) = GreedyColoring.colorGraph (traceWith "spacemap" $ fmap snd allocs) $ traceWith "graph" graph
+  maxes <- mapM (maxSubExp . Set.map (fst . (allocs !) . traceWith "look up")) $ Map.elems $ traceWith "inverted coloring" $ invertMap $ traceWith "coloring" coloring
+  -- assert (length maxes == Map.size colorspaces)
+  (colors, stms) <- collectStms $ mapM (\(i, x) -> letSubExp "color" $ Op $ Alloc x $ colorspaces ! i) $ zip [0 ..] $ traceWith "maxes" maxes
+  let segop' = setAllocsSegOp (traceWith "mapping" (fmap (colors !!) coloring)) segop
+  return $ case segop' of
+    SegMap lvl sp tps body -> SegMap lvl sp tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
+    _ -> undefined
 
--- optimise :: Stms KernelsMem -> ReuseAllocsM (Stms KernelsMem)
--- optimise stms =
---   localScope (scopeOf stms) $ do
---     let (aliased_stms, _) = Alias.analyseStms mempty stms
---         (lu_map, _) = LastUse.analyseStms mempty mempty aliased_stms
---     (allocs, frees, stms') <- optimiseStms lu_map [] [] stms
---     return $
---       trace
---         ( unlines
---             [ "allocs: " ++ pretty allocs,
---               "frees: " ++ pretty frees
---             ]
---         )
---         stms'
+onKernels :: (SegOp SegLevel KernelsMem -> ReuseAllocsM (SegOp SegLevel KernelsMem)) -> Stms KernelsMem -> ReuseAllocsM (Stms KernelsMem)
+onKernels f stms =
+  mapM helper stms
+  where
+    -- helper :: (LocalScope KernelsMem m, MonadFreshNames m) => Stm KernelsMem -> m (Stm KernelsMem)
+    helper stm@Let {stmExp = Op (Inner (SegOp segop))} =
+      inScopeOf stm $ do
+        exp' <- f segop
+        return $ stm {stmExp = Op $ Inner $ SegOp exp'}
+    helper stm@Let {stmExp = If c then_body else_body dec} =
+      inScopeOf stm $ do
+        then_body_stms <- f `onKernels` (bodyStms then_body)
+        else_body_stms <- f `onKernels` (bodyStms else_body)
+        return $
+          stm
+            { stmExp =
+                If
+                  c
+                  (then_body {bodyStms = then_body_stms})
+                  (else_body {bodyStms = else_body_stms})
+                  dec
+            }
+    helper stm@Let {stmExp = DoLoop ctx vals form body} =
+      inScopeOf stm $ do
+        bodyStms <- f `onKernels` bodyStms body
+        return $ stm {stmExp = DoLoop ctx vals form (body {bodyStms = bodyStms})}
+    helper stm =
+      inScopeOf stm $ return stm
 
--- optimiseStms :: LastUseMap -> Allocs -> Frees -> Stms KernelsMem -> ReuseAllocsM (Allocs, Frees, Stms KernelsMem)
--- optimiseStms lu_map allocs frees stms =
---   localScope (scopeOf stms) $ do
---     (allocs', frees', stms') <- foldM (walkStms lu_map) (allocs, frees, []) $ stmsToList stms
---     return (allocs', frees', stmsFromList $ reverse stms')
-
--- walkStms :: LastUseMap -> (Allocs, Frees, [Stm KernelsMem]) -> Stm KernelsMem -> ReuseAllocsM (Allocs, Frees, [Stm KernelsMem])
--- walkStms _ (allocs, frees, acc) stm@Let {stmExp = Op (Alloc sexp _), stmPattern = Pattern {patternValueElements = [PatElem {patElemName}]}} =
---   localScope (scopeOf stm) $ do
---     case lookup sexp $ map swap $ trace (unwords [pretty patElemName, "frees", pretty frees]) frees of
---       Just mem ->
---         return $
---           trace
---             (pretty patElemName ++ " found a result " ++ show mem)
---             ((patElemName, sexp) : allocs, filter ((/=) sexp . snd) frees, stm {stmExp = BasicOp $ SubExp $ Var mem} : acc)
---       Nothing ->
---         return ((patElemName, sexp) : allocs, frees, stm : acc)
--- walkStms lu_map (allocs, frees, acc) stm@Let {stmExp = Op (Inner (SegOp (SegMap lvl sp tps body)))} =
---   localScope (scopeOfSegSpace sp) $ do
---     (allocs', frees', body') <- optimiseKernelBody lu_map allocs frees body
---     return (allocs', frees', stm {stmExp = Op $ Inner $ SegOp $ SegMap lvl sp tps body'} : acc)
--- walkStms lu_map (allocs, frees, acc) stm@Let {stmExp = Op (Inner (SegOp (SegScan lvl sp binops tps body)))} = do
---   localScope (scopeOfSegSpace sp) $ do
---     (allocs', frees', body') <- optimiseKernelBody lu_map allocs frees body
---     (allocs'', frees'', binops') <- foldM (optimiseSegBinOp lu_map) (allocs', frees', []) binops
---     return (allocs'', frees'', stm {stmExp = Op $ Inner $ SegOp $ SegScan lvl sp (reverse binops') tps body'} : acc)
--- walkStms lu_map (allocs, frees, acc) stm@Let {stmExp = Op (Inner (SegOp (SegRed lvl sp binops tps body)))} =
---   localScope (scopeOfSegSpace sp) $ do
---     (allocs', frees', body') <- optimiseKernelBody lu_map allocs frees body
---     (allocs'', frees'', binops') <- foldM (optimiseSegBinOp lu_map) (allocs', frees', []) binops
---     return (allocs'', frees'', stm {stmExp = Op $ Inner $ SegOp $ SegRed lvl sp (reverse binops') tps body'} : acc)
--- walkStms lu_map (allocs, frees, acc) stm@Let {stmExp = Op (Inner (SegOp (SegHist lvl sp histops tps body)))} =
---   localScope (scopeOfSegSpace sp) $ do
---     (allocs', frees', body') <- optimiseKernelBody lu_map allocs frees body
---     (allocs'', frees'', histops') <- foldM (optimiseHistOp lu_map) (allocs', frees', []) histops
---     return (allocs'', frees'', stm {stmExp = Op $ Inner $ SegOp $ SegHist lvl sp (reverse histops') tps body'} : acc)
--- walkStms lu_map (allocs, frees, acc) stm = do
---   localScope (scopeOf stm) $ do
---     let pat_name = patElemName $ head $ patternValueElements $ stmPattern stm
---     let lus = Map.lookup pat_name lu_map
---     new_frees <- mapM (memAndSize allocs) $ maybe [] namesToList lus
---     let new_frees' = catMaybes new_frees
---     return $
---       trace
---         (unwords [pretty pat_name, " adding new frees: ", pretty new_frees', " to already ", pretty frees, " from lus:", pretty lus, " and allocs: ", pretty allocs])
---         (allocs, new_frees' ++ frees, stm : acc)
-
--- optimiseKernelBody :: LastUseMap -> Allocs -> Frees -> KernelBody KernelsMem -> ReuseAllocsM (Allocs, Frees, KernelBody KernelsMem)
--- optimiseKernelBody lu_map allocs frees body@KernelBody {kernelBodyStms} =
---   localScope (scopeOf kernelBodyStms) $ do
---     (allocs', frees', stms) <-
---       foldM (walkStms lu_map) (allocs, frees, []) $ stmsToList kernelBodyStms
---     return (allocs', frees', body {kernelBodyStms = stmsFromList $ reverse stms})
-
--- optimiseSegBinOp :: LastUseMap -> (Allocs, Frees, [SegBinOp KernelsMem]) -> SegBinOp KernelsMem -> ReuseAllocsM (Allocs, Frees, [SegBinOp KernelsMem])
--- optimiseSegBinOp lu_map (allocs, frees, acc) binop@SegBinOp {segBinOpLambda} = do
---   (allocs', frees', lambda) <- optimiseLambda lu_map allocs frees segBinOpLambda
---   return (allocs', frees', binop {segBinOpLambda = lambda} : acc)
-
--- optimiseHistOp :: LastUseMap -> (Allocs, Frees, [HistOp KernelsMem]) -> HistOp KernelsMem -> ReuseAllocsM (Allocs, Frees, [HistOp KernelsMem])
--- optimiseHistOp lu_map (allocs, frees, acc) histop@HistOp {histOp} = do
---   (allocs', frees', lambda) <- optimiseLambda lu_map allocs frees histOp
---   return (allocs', frees', histop {histOp = lambda} : acc)
-
--- optimiseLambda :: LastUseMap -> Allocs -> Frees -> Lambda KernelsMem -> ReuseAllocsM (Allocs, Frees, Lambda KernelsMem)
--- optimiseLambda lu_map allocs frees lambda =
---   localScope (scopeOfLParams $ lambdaParams lambda) $ do
---     (allocs', frees', body) <- optimiseBody lu_map allocs frees $ lambdaBody lambda
---     return (allocs', frees', lambda {lambdaBody = body})
-
--- optimiseBody :: LastUseMap -> Allocs -> Frees -> Body KernelsMem -> ReuseAllocsM (Allocs, Frees, Body KernelsMem)
--- optimiseBody lu_map allocs frees body =
---   localScope (scopeOf $ bodyStms body) $ do
---     (allocs', frees', stms') <- optimiseStms lu_map allocs frees $ bodyStms body
---     return (allocs', frees', body {bodyStms = stms'})
-
-memAndSize :: Allocs -> VName -> ReuseAllocsM (Maybe (VName, SubExp))
-memAndSize allocs vname = do
-  summary <- asksScope (fmap nameInfoToMemInfo . Map.lookup vname)
-  case summary of
-    Just (MemArray _ _ _ (ArrayIn mem _)) ->
-      return $ List.find ((== mem) . fst) allocs
-    _ ->
-      return Nothing
-
-nameInfoToMemInfo :: Mem lore => NameInfo lore -> MemBound NoUniqueness
-nameInfoToMemInfo info =
-  case info of
-    FParamName summary -> noUniquenessReturns summary
-    LParamName summary -> summary
-    LetName summary -> summary
-    IndexName it -> MemPrim $ IntType it
-
-memInfo :: VName -> ReuseAllocsM (Maybe (VName))
-memInfo vname = do
-  summary <- asksScope (fmap nameInfoToMemInfo . Map.lookup vname)
-  case summary of
-    Just (MemArray _ _ _ (ArrayIn mem _)) ->
-      return $ Just mem
-    _ ->
-      return Nothing
+optimise :: Pass KernelsMem KernelsMem
+optimise =
+  Pass "reuse allocations" "reuse allocations" $ \prog ->
+    let (lumap, _) = LastUse.analyseProg prog
+        (_, _, graph) =
+          foldMap (\f -> runReader (Interference.analyseKernels lumap (bodyStms $ funDefBody f)) $ scopeOf f) $
+            progFuns prog
+     in Pass.intraproceduralTransformation (onStms graph) $ trace ("optimise graph: " ++ pretty graph) prog
+  where
+    onStms :: Interference.Graph VName -> Scope KernelsMem -> Stms KernelsMem -> PassM (Stms KernelsMem)
+    onStms graph scope stms = do
+      let m = localScope scope $ optimiseKernel graph `onKernels` stms
+      res <- fmap fst $ modifyNameSource $ runState (runBinderT m mempty)
+      trace ("res:\n" ++ pretty res ++ "\n") $ return res
