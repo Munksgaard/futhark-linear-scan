@@ -15,7 +15,6 @@ import Data.Map (Map, (!))
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.Tuple (swap)
-import Debug.Trace
 import qualified Futhark.Analysis.Interference as Interference
 import qualified Futhark.Analysis.LastUse as LastUse
 import Futhark.Binder.Class
@@ -132,15 +131,13 @@ maxSubExp = helper . Set.toList
       return s
     helper [] = error "impossible"
 
-traceWith s a = trace (s ++ ": " ++ pretty a) a
-
 optimiseKernel :: Interference.Graph VName -> SegOp lvl KernelsMem -> ReuseAllocsM (SegOp lvl KernelsMem)
 optimiseKernel graph segop = do
-  let allocs = traceWith "allocs" $ getAllocsSegOp segop
-      (colorspaces, coloring) = GreedyColoring.colorGraph (traceWith "spacemap" $ fmap snd allocs) $ traceWith "graph" graph
-  maxes <- mapM (maxSubExp . Set.map (fst . (allocs !) . traceWith "look up")) $ Map.elems $ traceWith "inverted coloring" $ invertMap $ traceWith "coloring" coloring
-  (colors, stms) <- collectStms $ mapM (\(i, x) -> letSubExp "color" $ Op $ Alloc x $ colorspaces ! i) $ zip [0 ..] $ assert (length maxes == Map.size colorspaces) $ traceWith "maxes" maxes
-  let segop' = setAllocsSegOp (traceWith "mapping" (fmap (colors !!) coloring)) segop
+  let allocs = getAllocsSegOp segop
+      (colorspaces, coloring) = GreedyColoring.colorGraph (fmap snd allocs) graph
+  maxes <- mapM (maxSubExp . Set.map (fst . (allocs !))) $ Map.elems $ invertMap coloring
+  (colors, stms) <- collectStms $ mapM (\(i, x) -> letSubExp "color" $ Op $ Alloc x $ colorspaces ! i) $ zip [0 ..] $ assert (length maxes == Map.size colorspaces) maxes
+  let segop' = setAllocsSegOp ((fmap (colors !!) coloring)) segop
   return $ case segop' of
     SegMap lvl sp tps body -> SegMap lvl sp tps $ body {kernelBodyStms = stms <> kernelBodyStms body}
     _ -> undefined
@@ -181,10 +178,10 @@ optimise =
         (_, _, graph) =
           foldMap (\f -> runReader (Interference.analyseKernels lumap (bodyStms $ funDefBody f)) $ scopeOf f) $
             progFuns prog
-     in Pass.intraproceduralTransformation (onStms graph) $ trace ("optimise graph: " ++ pretty graph) prog
+     in Pass.intraproceduralTransformation (onStms graph) prog
   where
     onStms :: Interference.Graph VName -> Scope KernelsMem -> Stms KernelsMem -> PassM (Stms KernelsMem)
     onStms graph scope stms = do
       let m = localScope scope $ optimiseKernel graph `onKernels` stms
       res <- fmap fst $ modifyNameSource $ runState (runBinderT m mempty)
-      trace ("res:\n" ++ pretty res ++ "\n") $ return res
+      return res
