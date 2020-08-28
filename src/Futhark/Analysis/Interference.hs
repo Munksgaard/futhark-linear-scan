@@ -42,9 +42,10 @@ analyseStm lumap inuse0 stm =
         & patternValueElements
         & mapM (memInfo . patElemName)
         <&> catMaybes
+        <&> namesFromList
 
     -- `new_mems` should interfere with any mems inside the statement expression
-    let inuse_outside = inuse0 <> namesFromList new_mems
+    let inuse_outside = inuse0 <> new_mems
 
     -- `inuse` is the set of memory blocks that are inuse at the end of any code
     -- bodies inside the expression. `lus` is the set of all memory blocks that
@@ -63,8 +64,8 @@ analyseStm lumap inuse0 stm =
         <&> namesIntersection inuse_outside
 
     return
-      ( inuse_outside `namesSubtract` last_use_mems `namesSubtract` lus,
-        lus <> last_use_mems,
+      ( (inuse_outside `namesSubtract` last_use_mems `namesSubtract` lus) <> new_mems,
+        (lus <> last_use_mems) `namesSubtract` new_mems,
         graph <> (inuse_outside `cartesian` (inuse_outside <> inuse <> lus <> last_use_mems))
       )
 
