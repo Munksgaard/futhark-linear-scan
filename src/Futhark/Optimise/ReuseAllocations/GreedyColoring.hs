@@ -13,7 +13,7 @@ type Coloring a = Map a Int
 type Neighbors a = Map a (Set a)
 
 neighbors :: Ord a => Interference.Graph a -> Neighbors a
-neighbors graph =
+neighbors =
   Set.foldr
     ( \(x, y) acc ->
         acc
@@ -21,7 +21,6 @@ neighbors graph =
           & Map.insertWith Set.union y (Set.singleton x)
     )
     Map.empty
-    graph
 
 firstAvailable :: Eq space => Map Int space -> Set Int -> Int -> space -> (Map Int space, Int)
 firstAvailable spaces xs i sp =
